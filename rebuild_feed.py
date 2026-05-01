@@ -111,10 +111,12 @@ ROUTING = {
         "alba@elitepropertydxb.com",
         "diana@elitepropertydxb.com",
         "aaron@elitepropertydxb.com",
+        "jake@elitepropertydxb.com",
     ],
     "RR": [   # Residential Rent -- 294 listings
         "jennifer@elitepropertydxb.com",
         "evelyn@elitepropertydxb.com",
+       "diana@elitepropertydxb.com",
     ],
     "CS": [   # Commercial Sale -- 53 listings
         "jake@elitepropertydxb.com",

@@ -1,0 +1,147 @@
+name: Refresh feed
+
+# Runs once a day at 02:00 Dubai time (UTC+4 -> 22:00 UTC the previous day),
+# plus a manual "Run workflow" button in the Actions tab.
+on:
+  schedule:
+    - cron: "0 22 * * *"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Avoid two runs deploying at once.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  SOURCE_URL: "https://youtupia.net/eliteproperty/website/full.xml"
+  # Refuse to publish if the rebuilt feed has fewer than this many listings.
+  # Today the source has 840; if the source ever returns a tiny / broken file
+  # we don't want to overwrite a healthy published feed with garbage.
+  MIN_LISTINGS: "200"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download source feed (chunked - server times out on full GETs)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/chunks
+          SIZE=$(curl -sIL --max-time 30 "$SOURCE_URL" \
+            | awk -F': ' 'tolower($1)=="content-length" {print $2}' \
+            | tr -d '\r' | tail -n1)
+
+          echo "Source Content-Length: ${SIZE:-unknown}"
+          if [ -z "${SIZE:-}" ] || [ "$SIZE" -le 0 ]; then
+            echo "Falling back to single GET"
+            curl -sS --max-time 600 -o /tmp/feed.xml "$SOURCE_URL"
+          else
+            CHUNK=2500000
+            START=0
+            i=0
+            while [ "$START" -lt "$SIZE" ]; do
+              END=$(( START + CHUNK - 1 ))
+              [ "$END" -ge "$SIZE" ] && END=$(( SIZE - 1 ))
+              echo "Fetching bytes ${START}-${END}"
+              curl -sS --max-time 90 --range "${START}-${END}" \
+                   -o "/tmp/chunks/chunk_${i}.bin" "$SOURCE_URL"
+              START=$(( END + 1 ))
+              i=$(( i + 1 ))
+            done
+            cat /tmp/chunks/chunk_*.bin > /tmp/feed.xml
+          fi
+          ls -lh /tmp/feed.xml
+          echo "Source ends with:"
+          tail -c 80 /tmp/feed.xml || true
+
+      - name: Rebuild feed (6-agent rewrite)
+        run: |
+          set -euo pipefail
+          mkdir -p _site
+          python3 rebuild_feed.py /tmp/feed.xml _site/full.xml
+
+      - name: Sanity check output
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys, xml.etree.ElementTree as ET
+          path = "_site/full.xml"
+          tree = ET.parse(path)
+          root = tree.getroot()
+          props = root.findall("property")
+          n = len(props)
+          min_n = int(os.environ.get("MIN_LISTINGS", "200"))
+          print(f"Output property count: {n}")
+          if n < min_n:
+              print(f"REFUSING TO PUBLISH: only {n} listings (< MIN_LISTINGS={min_n})")
+              sys.exit(1)
+
+          allowed = {
+              "evelyn@elitepropertydxb.com", "alba@elitepropertydxb.com",
+              "diana@elitepropertydxb.com",  "aaron@elitepropertydxb.com",
+              "jake@elitepropertydxb.com",   "jennifer@elitepropertydxb.com",
+          }
+          emails = set()
+          for p in props:
+              a = p.find("agent")
+              if a is not None:
+                  emails.add((a.findtext("email") or "").strip().lower())
+          extra = emails - allowed
+          if extra:
+              print(f"REFUSING TO PUBLISH: unexpected agents in output: {extra}")
+              sys.exit(1)
+          print("Sanity check passed.")
+          PY
+
+      - name: Write landing page (so GH Pages root isn't 404)
+        run: |
+          cat > _site/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8">
+            <title>Elite Property DXB - feed</title>
+            <style>
+              body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; max-width: 720px; margin: 4rem auto; padding: 0 1rem; color: #222; }
+              code { background: #f3f3f3; padding: .15rem .35rem; border-radius: 4px; }
+              .pill { display: inline-block; background: #1a1a1a; color: #fff; padding: .25rem .75rem; border-radius: 999px; font-size: .85rem; }
+            </style>
+          </head>
+          <body>
+            <p class="pill">Elite Property DXB</p>
+            <h1>Public listings feed</h1>
+            <p>Stable URL for third-party integration:</p>
+            <p><a href="full.xml"><code>full.xml</code></a></p>
+            <p>Refreshed automatically every day at 02:00 Dubai time. Sourced from the Elite Property CRM and rewritten so that all listings are owned by 6 agents.</p>
+          </body>
+          </html>
+          HTML
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

@@ -1,49 +1,32 @@
 #!/usr/bin/env python3
 """
-Elite Property DXB - XML feed rebuilder
+Elite Property DXB - XML feed rebuilder.
 
-Reads the source CRM feed (with 25+ agents) and rewrites every property's
-<agent> block so that the resulting feed only contains 6 chosen agents.
-
-Rules
------
-1. Listings already owned by one of the 6 target agents stay with that agent
-   (no listing is moved between target agents).
-2. Listings owned by anyone else are reassigned by offering_type using a
-   round-robin across the agents the user nominated for that offering type.
-3. Every listing in the source feed is preserved byte-for-byte except for
-   the <agent>...</agent> block, which is replaced with a standardized one.
-4. Output is well-formed XML and the listing_count attribute is updated to
-   the actual number of properties found.
-
-Run:
-    python3 rebuild_feed.py feed.xml > new_feed.xml
+Reads the source CRM feed and rewrites every property's <agent> block so the
+output only contains 6 chosen agents. Optionally merges off-plan listings
+from the international + UK APIs and assigns those across the 6 agents
+using an equal round-robin.
 """
 
 from __future__ import annotations
 
+import argparse
 import hashlib
+import html
+import json
 import re
 import sys
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
 
-# --------------------------------------------------------------------------
-# 1. Target agents -- single source of truth.  Anything we publish about
-#    these agents on the integrating website comes from here.
-# --------------------------------------------------------------------------
-
 def _hash_id(email: str) -> str:
-    """Stable MD5-hex id derived from email -- matches the format used by
-    the source CRM, which we want to keep so portals that key on <id> don't
-    break."""
     return hashlib.md5(email.encode("utf-8")).hexdigest()
 
 
 TARGET_AGENTS = {
-    # key = lowercase email
     "evelyn@elitepropertydxb.com": {
         "id": "83efe5eb66e3ce15cb3e70a0243f02e9",
         "name": "Evelyn Oprea",
@@ -89,7 +72,6 @@ TARGET_AGENTS = {
         "name": "Jennifer Gorodetski",
         "email": "jennifer@elitepropertydxb.com",
         "phone": "971547223923",
-        # Source URL contains spaces -- URL-encode them so portals don't 404.
         "photo": (
             "https://crm.elitepropertydxb.com/upload/main/cc2/"
             "w38yu03o7n09nmmjg2qs1o5jl6uh4u8j/"
@@ -99,67 +81,39 @@ TARGET_AGENTS = {
     },
 }
 
-
-# --------------------------------------------------------------------------
-# 2. Routing rules per offering_type (provided by the user).  Each list is
-#    used as a round-robin pool; the order matters for fairness.
-# --------------------------------------------------------------------------
-
 ROUTING = {
-    "RS": [   # Residential Sale -- 488 listings
+    "RS": [
         "evelyn@elitepropertydxb.com",
         "alba@elitepropertydxb.com",
         "diana@elitepropertydxb.com",
         "aaron@elitepropertydxb.com",
-        "jake@elitepropertydxb.com",
     ],
-    "RR": [   # Residential Rent -- 294 listings
+    "RR": [
         "jennifer@elitepropertydxb.com",
         "evelyn@elitepropertydxb.com",
-       "diana@elitepropertydxb.com",
     ],
-    "CS": [   # Commercial Sale -- 53 listings
+    "CS": [
         "jake@elitepropertydxb.com",
         "alba@elitepropertydxb.com",
         "aaron@elitepropertydxb.com",
     ],
-    "CR": [   # Commercial Rent -- 5 listings
+    "CR": [
         "aaron@elitepropertydxb.com",
         "jake@elitepropertydxb.com",
     ],
 }
 
-# Fallback if a property has no/unknown offering_type -- spread across all 6.
 FALLBACK_POOL = list(TARGET_AGENTS.keys())
 
-
-# --------------------------------------------------------------------------
-# 3. XML helpers (regex-based -- avoids ElementTree re-serialising and
-#    breaking CDATA / Arabic content).
-# --------------------------------------------------------------------------
-
-PROPERTY_RE = re.compile(
-    r"<property\b[^>]*>.*?</property>",
-    re.DOTALL,
-)
-AGENT_RE = re.compile(
-    r"<agent>.*?</agent>",
-    re.DOTALL,
-)
-OFFERING_RE = re.compile(
-    r"<offering_type>\s*<!\[CDATA\[([^\]]*)\]\]>\s*</offering_type>",
-    re.DOTALL,
-)
-EMAIL_RE = re.compile(
-    r"<agent>.*?<email>\s*<!\[CDATA\[([^\]]*)\]\]>\s*</email>.*?</agent>",
-    re.DOTALL,
-)
+PROPERTY_RE = re.compile(r"<property\b[^>]*>.*?</property>", re.DOTALL)
+AGENT_RE = re.compile(r"<agent>.*?</agent>", re.DOTALL)
+OFFERING_RE = re.compile(r"<offering_type>\s*<!\[CDATA\[([^\]]*)\]\]>\s*</offering_type>", re.DOTALL)
+EMAIL_RE = re.compile(r"<agent>.*?<email>\s*<!\[CDATA\[([^\]]*)\]\]>\s*</email>.*?</agent>", re.DOTALL)
 LIST_OPEN_RE = re.compile(r"<list\b([^>]*)>")
 LISTING_COUNT_RE = re.compile(r'listing_count="(\d+)"')
 
 
 def render_agent_block(a: dict) -> str:
-    """Re-create an <agent> block in the exact shape the source feed uses."""
     return (
         "<agent>"
         f"<id><![CDATA[{a['id']}]]></id>"
@@ -172,40 +126,203 @@ def render_agent_block(a: dict) -> str:
     )
 
 
-# --------------------------------------------------------------------------
-# 4. Main rewrite logic
-# --------------------------------------------------------------------------
+def _cdata(value) -> str:
+    if value is None:
+        return ""
+    return str(value).replace("]]>", "]]]]><![CDATA[>")
 
-def rebuild(xml_text: str) -> tuple[str, dict]:
+
+_TAG_RE = re.compile(r"<[^>]+>")
+_WS_RE = re.compile(r"\s+")
+
+
+def _strip_html(value) -> str:
+    if not value:
+        return ""
+    text = html.unescape(_TAG_RE.sub(" ", str(value)))
+    return _WS_RE.sub(" ", text).strip()
+
+
+def _now_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%y-%m-%d %H:%M:%S")
+
+
+def _xml_completion(api_status) -> str:
+    s = (api_status or "").strip().lower()
+    if s in {"completed", "complete", "current", "ready"}:
+        return "completed"
+    return "off_plan"
+
+
+def _intl_block(rec, agent_email, stamp):
+    rid = rec.get("id")
+    if rid is None:
+        return ""
+    pid = 500000 + int(rid)
+    ref = rec.get("reference_number") or f"REELLY-{rid}"
+    title = rec.get("title_en") or rec.get("property_name") or ref
+    desc = rec.get("description_en") or ""
+    price = rec.get("price") or "0"
+    offering = (rec.get("offering_type") or "RS").upper()
+    ptype = (rec.get("property_type") or "AP").upper()
+    size = rec.get("size") or "0"
+    bedroom = rec.get("bedroom") or "0"
+    bathroom = rec.get("bathroom") or "0"
+    completion = _xml_completion(rec.get("completion_status"))
+
+    emirate = rec.get("emirate") or {}
+    location_name = emirate.get("name") or rec.get("city") or "International"
+    if "," in location_name:
+        city = location_name.split(",")[-1].strip()
+    else:
+        city = location_name
+    community = location_name
+    sub_community = location_name
+
+    photos = rec.get("photos") or []
+    photo_urls = [(p.get("url") or "").strip() for p in photos if p.get("url")]
+
+    parts = [
+        f'<property last_update="{stamp}" id="{pid}">',
+        f"<reference_number><![CDATA[{_cdata(ref)}]]></reference_number>",
+        f"<price><![CDATA[{_cdata(price)}]]></price>",
+        f"<price_currency><![CDATA[{_cdata(rec.get('price_currency') or 'AED')}]]></price_currency>",
+        f"<offering_type><![CDATA[{_cdata(offering)}]]></offering_type>",
+        f"<property_type><![CDATA[{_cdata(ptype)}]]></property_type>",
+        f"<city><![CDATA[{_cdata(city)}]]></city>",
+        f"<community><![CDATA[{_cdata(community)}]]></community>",
+        f"<sub_community><![CDATA[{_cdata(sub_community)}]]></sub_community>",
+        f"<title_en><![CDATA[{_cdata(title)}]]></title_en>",
+        f"<description_en><![CDATA[{_cdata(desc)}]]></description_en>",
+        f"<size><![CDATA[{_cdata(size)}]]></size>",
+        f"<bedroom><![CDATA[{_cdata(bedroom)}]]></bedroom>",
+        f"<bathroom><![CDATA[{_cdata(bathroom)}]]></bathroom>",
+        f"<completion_status><![CDATA[{_cdata(completion)}]]></completion_status>",
+        f"<developer><![CDATA[{_cdata(rec.get('developer') or '')}]]></developer>",
+        "<source><![CDATA[reelly-international]]></source>",
+        render_agent_block(TARGET_AGENTS[agent_email]),
+    ]
+    if photo_urls:
+        photo_section = ["<photo>"]
+        for u in photo_urls[:30]:
+            photo_section.append(f'<url last_update="{stamp}" watermark="No"><![CDATA[{_cdata(u)}]]></url>')
+            photo_section.append(f"<original_url><![CDATA[{_cdata(u)}]]></original_url>")
+        photo_section.append("</photo>")
+        parts.append("".join(photo_section))
+    parts.append("<is_featured><![CDATA[0]]></is_featured>")
+    parts.append("<is_exclusive><![CDATA[0]]></is_exclusive>")
+    parts.append("<branch><![CDATA[International]]></branch>")
+    parts.append("</property>")
+    return "".join(parts)
+
+
+def _uk_block(rec, agent_email, stamp):
+    rid = rec.get("id")
+    if rid is None:
+        return ""
+    pid = 600000 + int(rid)
+    ref = f"UK-{rid}"
+    title = rec.get("title") or ref
+
+    raw_price = (rec.get("prices_from") or "0").replace(",", "").strip()
+    try:
+        price_num = str(int(float(raw_price))) if raw_price else "0"
+    except ValueError:
+        price_num = "0"
+
+    desc = _strip_html(rec.get("intro") or rec.get("content") or "")
+    if len(desc) > 4000:
+        desc = desc[:4000].rstrip() + "..."
+
+    location = (rec.get("location") or "").strip()
+    city = location.split(" ")[0] if location else "United Kingdom"
+    completion = _xml_completion(rec.get("status") or rec.get("development_type"))
+    thumbnail = (rec.get("thumbnail") or "").strip()
+
+    parts = [
+        f'<property last_update="{stamp}" id="{pid}">',
+        f"<reference_number><![CDATA[{_cdata(ref)}]]></reference_number>",
+        f"<price><![CDATA[{_cdata(price_num)}]]></price>",
+        "<price_currency><![CDATA[GBP]]></price_currency>",
+        "<offering_type><![CDATA[RS]]></offering_type>",
+        "<property_type><![CDATA[AP]]></property_type>",
+        f"<city><![CDATA[{_cdata(city)}]]></city>",
+        f"<community><![CDATA[{_cdata(location)}]]></community>",
+        f"<sub_community><![CDATA[{_cdata(location)}]]></sub_community>",
+        f"<title_en><![CDATA[{_cdata(title)}]]></title_en>",
+        f"<description_en><![CDATA[{_cdata(desc)}]]></description_en>",
+        "<size><![CDATA[0]]></size>",
+        "<bedroom><![CDATA[0]]></bedroom>",
+        "<bathroom><![CDATA[0]]></bathroom>",
+        f"<completion_status><![CDATA[{_cdata(completion)}]]></completion_status>",
+        "<source><![CDATA[uk-properties]]></source>",
+        render_agent_block(TARGET_AGENTS[agent_email]),
+    ]
+    if thumbnail:
+        parts.append(
+            "<photo>"
+            f'<url last_update="{stamp}" watermark="No"><![CDATA[{_cdata(thumbnail)}]]></url>'
+            f"<original_url><![CDATA[{_cdata(thumbnail)}]]></original_url>"
+            "</photo>"
+        )
+    parts.append("<is_featured><![CDATA[0]]></is_featured>")
+    parts.append("<is_exclusive><![CDATA[0]]></is_exclusive>")
+    parts.append("<branch><![CDATA[UK]]></branch>")
+    parts.append("</property>")
+    return "".join(parts)
+
+
+def build_offplan_blocks(json_path):
+    data = json.loads(json_path.read_text(encoding="utf-8"))
+    stamp = _now_stamp()
+    pool = list(TARGET_AGENTS.keys())
+    rr = [0]
+    per_agent = Counter()
+
+    def next_agent():
+        e = pool[rr[0] % len(pool)]
+        rr[0] += 1
+        per_agent[e] += 1
+        return e
+
+    blocks = []
+    for rec in (data.get("international") or []):
+        b = _intl_block(rec, next_agent(), stamp)
+        if b:
+            blocks.append(b)
+    for rec in (data.get("uk") or []):
+        b = _uk_block(rec, next_agent(), stamp)
+        if b:
+            blocks.append(b)
+    return blocks, per_agent
+
+
+def rebuild(xml_text, extra_property_blocks=None):
     properties = PROPERTY_RE.findall(xml_text)
     if not properties:
-        raise SystemExit("No <property> blocks found -- input does not look like the expected feed")
+        raise SystemExit("No <property> blocks found in source")
+    if extra_property_blocks:
+        properties.extend(extra_property_blocks)
 
-    # Round-robin counters per pool
-    pool_index: dict[str, int] = {k: 0 for k in ROUTING}
+    pool_index = {k: 0 for k in ROUTING}
     pool_index["__fallback__"] = 0
 
     stats = {
         "total": len(properties),
-        "kept_with_owner": Counter(),       # listings already on a target agent
-        "reassigned_by_pool": Counter(),    # listings reassigned per offering_type
-        "assigned_to": Counter(),           # final per-agent count
+        "kept_with_owner": Counter(),
+        "reassigned_by_pool": Counter(),
+        "assigned_to": Counter(),
         "missing_agent_block": 0,
         "fallback_used": 0,
     }
 
-    new_properties: list[str] = []
-
+    new_properties = []
     for prop in properties:
-        # Detect current agent's email
         m_email = EMAIL_RE.search(prop)
         current_email = m_email.group(1).strip().lower() if m_email else ""
-
-        # Detect offering type
         m_off = OFFERING_RE.search(prop)
         offering = (m_off.group(1).strip().upper() if m_off else "")
 
-        # Decide which agent to use
         if current_email in TARGET_AGENTS:
             chosen_email = current_email
             stats["kept_with_owner"][chosen_email] += 1
@@ -222,23 +339,18 @@ def rebuild(xml_text: str) -> tuple[str, dict]:
             stats["reassigned_by_pool"][offering or "?"] += 1
 
         agent_block = render_agent_block(TARGET_AGENTS[chosen_email])
-
         if AGENT_RE.search(prop):
             new_prop = AGENT_RE.sub(agent_block, prop, count=1)
         else:
-            # If a property had no <agent> at all, append one before </property>
             stats["missing_agent_block"] += 1
             new_prop = prop.replace("</property>", agent_block + "</property>", 1)
 
         new_properties.append(new_prop)
         stats["assigned_to"][chosen_email] += 1
 
-    # Stitch the document back together: keep the original <list ...> opening
-    # but update listing_count to the actual count, and emit a clean </list>.
     list_open_match = LIST_OPEN_RE.search(xml_text)
     if not list_open_match:
-        raise SystemExit("Could not find <list ...> opening tag in source")
-
+        raise SystemExit("Could not find <list> opening tag")
     list_attrs = list_open_match.group(1)
     new_count = str(len(new_properties))
     if LISTING_COUNT_RE.search(list_attrs):
@@ -255,14 +367,27 @@ def rebuild(xml_text: str) -> tuple[str, dict]:
     return output, stats
 
 
-def main() -> int:
-    src = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("feed.xml")
-    out = Path(sys.argv[2]) if len(sys.argv) > 2 else Path("new_feed.xml")
+def main():
+    parser = argparse.ArgumentParser(description="Rebuild Elite Property feed with 6-agent mapping.")
+    parser.add_argument("source", nargs="?", default="feed.xml")
+    parser.add_argument("output", nargs="?", default="new_feed.xml")
+    parser.add_argument("--offplan", help="Path to combined off-plan JSON from fetch_offplan.py")
+    args = parser.parse_args()
+
+    src = Path(args.source)
+    out = Path(args.output)
     xml_text = src.read_text(encoding="utf-8")
-    new_xml, stats = rebuild(xml_text)
+
+    extras = []
+    offplan_per_agent = Counter()
+    if args.offplan:
+        json_path = Path(args.offplan)
+        extras, offplan_per_agent = build_offplan_blocks(json_path)
+        sys.stderr.write(f"Off-plan blocks merged    : {len(extras)} (from {json_path})\n")
+
+    new_xml, stats = rebuild(xml_text, extra_property_blocks=extras)
     out.write_text(new_xml, encoding="utf-8")
 
-    # Report
     sys.stderr.write(f"Input  : {src}  ({len(xml_text):,} bytes)\n")
     sys.stderr.write(f"Output : {out}  ({len(new_xml):,} bytes)\n")
     sys.stderr.write(f"Properties processed     : {stats['total']}\n")
@@ -279,6 +404,10 @@ def main() -> int:
     sys.stderr.write("\nKept (already owned by target agent):\n")
     for email, n in stats["kept_with_owner"].most_common():
         sys.stderr.write(f"  {n:5d}  {TARGET_AGENTS[email]['name']:30s}\n")
+    if offplan_per_agent:
+        sys.stderr.write("\nOff-plan equal round-robin per agent:\n")
+        for email, n in offplan_per_agent.most_common():
+            sys.stderr.write(f"  {n:5d}  {TARGET_AGENTS[email]['name']:30s}\n")
     return 0
 
 

@@ -114,21 +114,4 @@ If you want the feed on `feed.elitepropertydxb.com` instead:
 1. Edit `rebuild_feed.py` (`TARGET_AGENTS` and `ROUTING` at the top).
 2. Commit on GitHub (web editor is fine).
 3. The next scheduled run picks up the change. Or, hit "Run workflow"
-   in the Actions tab to apply immediately.
-
-## When the source feed is broken
-If the source CRM returns a tiny / corrupt feed for a day, the workflow
-**will not** overwrite the published feed. The previous good copy stays
-live until the next successful run. Watch the Actions tab for a red run
-- click in to see what failed.
-
-## Manual local rebuild
-You don't need this for normal operation, but if you want to test
-locally:
-
-```bash
-curl -sS -o feed.xml "https://youtupia.net/eliteproperty/website/full.xml"
-python3 rebuild_feed.py feed.xml new_feed.xml
-```
-
-(Pure Python 3, no extra packages required.)
+   in the Actions tab to apply im

@@ -19,9 +19,9 @@ concurrency:
 
 env:
   SOURCE_URL: "https://youtupia.net/eliteproperty/website/full.xml"
+  INTL_API:   "https://elitepropertydxb.com/api/properties/international"
+  UK_API:     "https://elitepropertydxb.com/api/properties/uk-properties"
   # Refuse to publish if the rebuilt feed has fewer than this many listings.
-  # Today the source has 840; if the source ever returns a tiny / broken file
-  # we don't want to overwrite a healthy published feed with garbage.
   MIN_LISTINGS: "200"
 
 jobs:
@@ -36,14 +36,13 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Download source feed (chunked - server times out on full GETs)
+      - name: Download source CRM feed (chunked - server times out on full GETs)
         run: |
           set -euo pipefail
           mkdir -p /tmp/chunks
           SIZE=$(curl -sIL --max-time 30 "$SOURCE_URL" \
             | awk -F': ' 'tolower($1)=="content-length" {print $2}' \
             | tr -d '\r' | tail -n1)
-
           echo "Source Content-Length: ${SIZE:-unknown}"
           if [ -z "${SIZE:-}" ] || [ "$SIZE" -le 0 ]; then
             echo "Falling back to single GET"
@@ -67,11 +66,27 @@ jobs:
           echo "Source ends with:"
           tail -c 80 /tmp/feed.xml || true
 
-      - name: Rebuild feed (6-agent rewrite)
+      - name: Fetch off-plan APIs (international + UK)
+        # If the APIs are down, log a warning and continue without off-plan
+        # data so we still publish a fresh CRM-only feed.
+        run: |
+          if python3 fetch_offplan.py /tmp/offplan_all.json; then
+            echo "Off-plan fetch OK"
+            python3 -c "import json; d=json.load(open('/tmp/offplan_all.json')); print('intl:', len(d['international']), 'uk:', len(d['uk']))"
+          else
+            echo "::warning::Off-plan fetch failed; publishing CRM-only feed"
+            rm -f /tmp/offplan_all.json
+          fi
+
+      - name: Rebuild feed (6-agent rewrite + off-plan merge)
         run: |
           set -euo pipefail
           mkdir -p _site
-          python3 rebuild_feed.py /tmp/feed.xml _site/full.xml
+          if [ -f /tmp/offplan_all.json ]; then
+            python3 rebuild_feed.py /tmp/feed.xml _site/full.xml --offplan /tmp/offplan_all.json
+          else
+            python3 rebuild_feed.py /tmp/feed.xml _site/full.xml
+          fi
 
       - name: Sanity check output
         run: |
@@ -88,7 +103,6 @@ jobs:
           if n < min_n:
               print(f"REFUSING TO PUBLISH: only {n} listings (< MIN_LISTINGS={min_n})")
               sys.exit(1)
-
           allowed = {
               "evelyn@elitepropertydxb.com", "alba@elitepropertydxb.com",
               "diana@elitepropertydxb.com",  "aaron@elitepropertydxb.com",
@@ -125,7 +139,13 @@ jobs:
             <h1>Public listings feed</h1>
             <p>Stable URL for third-party integration:</p>
             <p><a href="full.xml"><code>full.xml</code></a></p>
-            <p>Refreshed automatically every day at 02:00 Dubai time. Sourced from the Elite Property CRM and rewritten so that all listings are owned by 6 agents.</p>
+            <p>Refreshed automatically every day at 02:00 Dubai time. Sources:</p>
+            <ul>
+              <li>Elite Property DXB CRM</li>
+              <li>International off-plan API (Reelly)</li>
+              <li>UK off-plan API (Prosperity Wealth)</li>
+            </ul>
+            <p>All listings are mapped to 6 agents.</p>
           </body>
           </html>
           HTML

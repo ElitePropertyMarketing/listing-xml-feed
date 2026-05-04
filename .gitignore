@@ -4,5 +4,4 @@ __pycache__/
 feed.xml
 new_feed.xml
 chunk_*.bin
-chunk*.bin
 _site/

@@ -19,10 +19,9 @@ concurrency:
 
 env:
   SOURCE_URL: "https://youtupia.net/eliteproperty/website/full.xml"
-  INTL_API:   "https://elitepropertydxb.com/api/properties/international"
-  UK_API:     "https://elitepropertydxb.com/api/properties/uk-properties"
   # Refuse to publish if the rebuilt feed has fewer than this many listings.
-  MIN_LISTINGS: "200"
+  # CRM-only fallback should still publish ~840 listings, so 700 is a safe floor.
+  MIN_LISTINGS: "700"
 
 jobs:
   build:
@@ -36,7 +35,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Download source CRM feed (chunked - server times out on full GETs)
+      - name: Download source CRM feed (chunked)
         run: |
           set -euo pipefail
           mkdir -p /tmp/chunks
@@ -45,7 +44,6 @@ jobs:
             | tr -d '\r' | tail -n1)
           echo "Source Content-Length: ${SIZE:-unknown}"
           if [ -z "${SIZE:-}" ] || [ "$SIZE" -le 0 ]; then
-            echo "Falling back to single GET"
             curl -sS --max-time 600 -o /tmp/feed.xml "$SOURCE_URL"
           else
             CHUNK=2500000
@@ -54,7 +52,6 @@ jobs:
             while [ "$START" -lt "$SIZE" ]; do
               END=$(( START + CHUNK - 1 ))
               [ "$END" -ge "$SIZE" ] && END=$(( SIZE - 1 ))
-              echo "Fetching bytes ${START}-${END}"
               curl -sS --max-time 90 --range "${START}-${END}" \
                    -o "/tmp/chunks/chunk_${i}.bin" "$SOURCE_URL"
               START=$(( END + 1 ))
@@ -63,27 +60,24 @@ jobs:
             cat /tmp/chunks/chunk_*.bin > /tmp/feed.xml
           fi
           ls -lh /tmp/feed.xml
-          echo "Source ends with:"
-          tail -c 80 /tmp/feed.xml || true
 
-      - name: Fetch off-plan APIs (international + UK)
-        # If the APIs are down, log a warning and continue without off-plan
-        # data so we still publish a fresh CRM-only feed.
+      - name: Fetch UAE off-plan from Reelly API (parallel pagination)
+        # If the API is down or returns nothing, log a warning and continue
+        # with CRM only - we still publish a fresh feed instead of going dark.
         run: |
-          if python3 fetch_offplan.py /tmp/offplan_all.json; then
-            echo "Off-plan fetch OK"
-            python3 -c "import json; d=json.load(open('/tmp/offplan_all.json')); print('intl:', len(d['international']), 'uk:', len(d['uk']))"
+          if python3 fetch_offplan.py /tmp/offplan_uae.json; then
+            python3 -c "import json; d=json.load(open('/tmp/offplan_uae.json')); print('UAE active off-plan kept:', len(d['international']))"
           else
             echo "::warning::Off-plan fetch failed; publishing CRM-only feed"
-            rm -f /tmp/offplan_all.json
+            rm -f /tmp/offplan_uae.json
           fi
 
-      - name: Rebuild feed (6-agent rewrite + off-plan merge)
+      - name: Rebuild feed (6-agent rewrite + UAE off-plan merge)
         run: |
           set -euo pipefail
           mkdir -p _site
-          if [ -f /tmp/offplan_all.json ]; then
-            python3 rebuild_feed.py /tmp/feed.xml _site/full.xml --offplan /tmp/offplan_all.json
+          if [ -f /tmp/offplan_uae.json ]; then
+            python3 rebuild_feed.py /tmp/feed.xml _site/full.xml --offplan /tmp/offplan_uae.json
           else
             python3 rebuild_feed.py /tmp/feed.xml _site/full.xml
           fi
@@ -98,7 +92,7 @@ jobs:
           root = tree.getroot()
           props = root.findall("property")
           n = len(props)
-          min_n = int(os.environ.get("MIN_LISTINGS", "200"))
+          min_n = int(os.environ.get("MIN_LISTINGS", "700"))
           print(f"Output property count: {n}")
           if n < min_n:
               print(f"REFUSING TO PUBLISH: only {n} listings (< MIN_LISTINGS={min_n})")
@@ -120,7 +114,7 @@ jobs:
           print("Sanity check passed.")
           PY
 
-      - name: Write landing page (so GH Pages root isn't 404)
+      - name: Write landing page
         run: |
           cat > _site/index.html <<'HTML'
           <!doctype html>
@@ -141,11 +135,10 @@ jobs:
             <p><a href="full.xml"><code>full.xml</code></a></p>
             <p>Refreshed automatically every day at 02:00 Dubai time. Sources:</p>
             <ul>
-              <li>Elite Property DXB CRM</li>
-              <li>International off-plan API (Reelly)</li>
-              <li>UK off-plan API (Prosperity Wealth)</li>
+              <li>Elite Property DXB CRM (Bitrix24)</li>
+              <li>UAE off-plan projects (Reelly), excluding completed</li>
             </ul>
-            <p>All listings are mapped to 6 agents.</p>
+            <p>All listings mapped to 6 agents.</p>
           </body>
           </html>
           HTML

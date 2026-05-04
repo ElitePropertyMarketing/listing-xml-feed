@@ -2,10 +2,15 @@
 """
 Elite Property DXB - XML feed rebuilder.
 
-Reads the source CRM feed and rewrites every property's <agent> block so the
-output only contains 6 chosen agents. Optionally merges off-plan listings
-from the international + UK APIs and assigns those across the 6 agents
-using an equal round-robin.
+Reads the source CRM (Bitrix24) XML feed and rewrites every property's
+<agent> block so the output only contains 6 chosen agents. Optionally
+merges UAE off-plan projects from the Reelly API and assigns those
+listings via an equal round-robin across the 6 agents.
+
+Usage
+-----
+    python3 rebuild_feed.py feed.xml new_feed.xml
+    python3 rebuild_feed.py feed.xml new_feed.xml --offplan offplan_uae.json
 """
 
 from __future__ import annotations
@@ -21,6 +26,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+
+# ---------------------------------------------------------------------------
+# Target agents
+# ---------------------------------------------------------------------------
 
 def _hash_id(email: str) -> str:
     return hashlib.md5(email.encode("utf-8")).hexdigest()
@@ -105,6 +114,11 @@ ROUTING = {
 
 FALLBACK_POOL = list(TARGET_AGENTS.keys())
 
+
+# ---------------------------------------------------------------------------
+# XML helpers
+# ---------------------------------------------------------------------------
+
 PROPERTY_RE = re.compile(r"<property\b[^>]*>.*?</property>", re.DOTALL)
 AGENT_RE = re.compile(r"<agent>.*?</agent>", re.DOTALL)
 OFFERING_RE = re.compile(r"<offering_type>\s*<!\[CDATA\[([^\]]*)\]\]>\s*</offering_type>", re.DOTALL)
@@ -126,10 +140,18 @@ def render_agent_block(a: dict) -> str:
     )
 
 
+# XML 1.0 disallows most control characters (everything in 0x00-0x1F except
+# \t \n \r). Reelly descriptions sometimes contain stray bytes like \x1d
+# (Group Separator) that break parsers downstream. Strip them.
+_XML_ILLEGAL_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+
 def _cdata(value) -> str:
     if value is None:
         return ""
-    return str(value).replace("]]>", "]]]]><![CDATA[>")
+    s = str(value)
+    s = _XML_ILLEGAL_CTRL_RE.sub("", s)
+    return s.replace("]]>", "]]]]><![CDATA[>")
 
 
 _TAG_RE = re.compile(r"<[^>]+>")
@@ -148,13 +170,14 @@ def _now_stamp() -> str:
 
 
 def _xml_completion(api_status) -> str:
+    """Map Reelly's status vocab to the CRM feed vocab."""
     s = (api_status or "").strip().lower()
     if s in {"completed", "complete", "current", "ready"}:
         return "completed"
     return "off_plan"
 
 
-def _intl_block(rec, agent_email, stamp):
+def _intl_block(rec: dict, agent_email: str, stamp: str) -> str:
     rid = rec.get("id")
     if rid is None:
         return ""
@@ -171,7 +194,7 @@ def _intl_block(rec, agent_email, stamp):
     completion = _xml_completion(rec.get("completion_status"))
 
     emirate = rec.get("emirate") or {}
-    location_name = emirate.get("name") or rec.get("city") or "International"
+    location_name = emirate.get("name") or rec.get("city") or "UAE"
     if "," in location_name:
         city = location_name.split(",")[-1].strip()
     else:
@@ -199,7 +222,7 @@ def _intl_block(rec, agent_email, stamp):
         f"<bathroom><![CDATA[{_cdata(bathroom)}]]></bathroom>",
         f"<completion_status><![CDATA[{_cdata(completion)}]]></completion_status>",
         f"<developer><![CDATA[{_cdata(rec.get('developer') or '')}]]></developer>",
-        "<source><![CDATA[reelly-international]]></source>",
+        "<source><![CDATA[reelly-uae-offplan]]></source>",
         render_agent_block(TARGET_AGENTS[agent_email]),
     ]
     if photo_urls:
@@ -211,93 +234,41 @@ def _intl_block(rec, agent_email, stamp):
         parts.append("".join(photo_section))
     parts.append("<is_featured><![CDATA[0]]></is_featured>")
     parts.append("<is_exclusive><![CDATA[0]]></is_exclusive>")
-    parts.append("<branch><![CDATA[International]]></branch>")
+    parts.append("<branch><![CDATA[Off-Plan UAE]]></branch>")
     parts.append("</property>")
     return "".join(parts)
 
 
-def _uk_block(rec, agent_email, stamp):
-    rid = rec.get("id")
-    if rid is None:
-        return ""
-    pid = 600000 + int(rid)
-    ref = f"UK-{rid}"
-    title = rec.get("title") or ref
-
-    raw_price = (rec.get("prices_from") or "0").replace(",", "").strip()
-    try:
-        price_num = str(int(float(raw_price))) if raw_price else "0"
-    except ValueError:
-        price_num = "0"
-
-    desc = _strip_html(rec.get("intro") or rec.get("content") or "")
-    if len(desc) > 4000:
-        desc = desc[:4000].rstrip() + "..."
-
-    location = (rec.get("location") or "").strip()
-    city = location.split(" ")[0] if location else "United Kingdom"
-    completion = _xml_completion(rec.get("status") or rec.get("development_type"))
-    thumbnail = (rec.get("thumbnail") or "").strip()
-
-    parts = [
-        f'<property last_update="{stamp}" id="{pid}">',
-        f"<reference_number><![CDATA[{_cdata(ref)}]]></reference_number>",
-        f"<price><![CDATA[{_cdata(price_num)}]]></price>",
-        "<price_currency><![CDATA[GBP]]></price_currency>",
-        "<offering_type><![CDATA[RS]]></offering_type>",
-        "<property_type><![CDATA[AP]]></property_type>",
-        f"<city><![CDATA[{_cdata(city)}]]></city>",
-        f"<community><![CDATA[{_cdata(location)}]]></community>",
-        f"<sub_community><![CDATA[{_cdata(location)}]]></sub_community>",
-        f"<title_en><![CDATA[{_cdata(title)}]]></title_en>",
-        f"<description_en><![CDATA[{_cdata(desc)}]]></description_en>",
-        "<size><![CDATA[0]]></size>",
-        "<bedroom><![CDATA[0]]></bedroom>",
-        "<bathroom><![CDATA[0]]></bathroom>",
-        f"<completion_status><![CDATA[{_cdata(completion)}]]></completion_status>",
-        "<source><![CDATA[uk-properties]]></source>",
-        render_agent_block(TARGET_AGENTS[agent_email]),
-    ]
-    if thumbnail:
-        parts.append(
-            "<photo>"
-            f'<url last_update="{stamp}" watermark="No"><![CDATA[{_cdata(thumbnail)}]]></url>'
-            f"<original_url><![CDATA[{_cdata(thumbnail)}]]></original_url>"
-            "</photo>"
-        )
-    parts.append("<is_featured><![CDATA[0]]></is_featured>")
-    parts.append("<is_exclusive><![CDATA[0]]></is_exclusive>")
-    parts.append("<branch><![CDATA[UK]]></branch>")
-    parts.append("</property>")
-    return "".join(parts)
-
-
-def build_offplan_blocks(json_path):
+def build_offplan_blocks(json_path: Path) -> tuple[list[str], Counter]:
+    """Read pre-filtered UAE off-plan JSON and return XML <property> blocks
+    plus a Counter of how many were assigned to each agent (equal round-robin
+    across all 6 target agents)."""
     data = json.loads(json_path.read_text(encoding="utf-8"))
     stamp = _now_stamp()
+
     pool = list(TARGET_AGENTS.keys())
     rr = [0]
-    per_agent = Counter()
+    per_agent: Counter = Counter()
 
-    def next_agent():
+    def next_agent() -> str:
         e = pool[rr[0] % len(pool)]
         rr[0] += 1
         per_agent[e] += 1
         return e
 
-    blocks = []
+    blocks: list[str] = []
     for rec in (data.get("international") or []):
         b = _intl_block(rec, next_agent(), stamp)
-        if b:
-            blocks.append(b)
-    for rec in (data.get("uk") or []):
-        b = _uk_block(rec, next_agent(), stamp)
         if b:
             blocks.append(b)
     return blocks, per_agent
 
 
-def rebuild(xml_text, extra_property_blocks=None):
+# ---------------------------------------------------------------------------
+# CRM rewrite
+# ---------------------------------------------------------------------------
+
+def rebuild(xml_text: str, extra_property_blocks: list[str] | None = None) -> tuple[str, dict]:
     properties = PROPERTY_RE.findall(xml_text)
     if not properties:
         raise SystemExit("No <property> blocks found in source")
@@ -316,7 +287,7 @@ def rebuild(xml_text, extra_property_blocks=None):
         "fallback_used": 0,
     }
 
-    new_properties = []
+    new_properties: list[str] = []
     for prop in properties:
         m_email = EMAIL_RE.search(prop)
         current_email = m_email.group(1).strip().lower() if m_email else ""
@@ -367,19 +338,19 @@ def rebuild(xml_text, extra_property_blocks=None):
     return output, stats
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser(description="Rebuild Elite Property feed with 6-agent mapping.")
     parser.add_argument("source", nargs="?", default="feed.xml")
     parser.add_argument("output", nargs="?", default="new_feed.xml")
-    parser.add_argument("--offplan", help="Path to combined off-plan JSON from fetch_offplan.py")
+    parser.add_argument("--offplan", help="Path to pre-filtered UAE off-plan JSON (from fetch_offplan.py)")
     args = parser.parse_args()
 
     src = Path(args.source)
     out = Path(args.output)
     xml_text = src.read_text(encoding="utf-8")
 
-    extras = []
-    offplan_per_agent = Counter()
+    extras: list[str] = []
+    offplan_per_agent: Counter = Counter()
     if args.offplan:
         json_path = Path(args.offplan)
         extras, offplan_per_agent = build_offplan_blocks(json_path)
@@ -394,15 +365,8 @@ def main():
     sys.stderr.write(f"Kept with current owner  : {sum(stats['kept_with_owner'].values())}\n")
     sys.stderr.write(f"Reassigned via pool      : {sum(stats['reassigned_by_pool'].values())}\n")
     sys.stderr.write(f"Fallback pool used       : {stats['fallback_used']}\n")
-    sys.stderr.write(f"Properties missing agent : {stats['missing_agent_block']}\n")
     sys.stderr.write("\nFinal counts per agent:\n")
     for email, n in stats["assigned_to"].most_common():
-        sys.stderr.write(f"  {n:5d}  {TARGET_AGENTS[email]['name']:30s}  ({email})\n")
-    sys.stderr.write("\nReassigned per offering_type:\n")
-    for off, n in stats["reassigned_by_pool"].most_common():
-        sys.stderr.write(f"  {n:5d}  {off}\n")
-    sys.stderr.write("\nKept (already owned by target agent):\n")
-    for email, n in stats["kept_with_owner"].most_common():
         sys.stderr.write(f"  {n:5d}  {TARGET_AGENTS[email]['name']:30s}\n")
     if offplan_per_agent:
         sys.stderr.write("\nOff-plan equal round-robin per agent:\n")

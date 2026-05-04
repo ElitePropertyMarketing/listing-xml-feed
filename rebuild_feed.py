@@ -178,6 +178,10 @@ def _xml_completion(api_status) -> str:
 
 
 def _intl_block(rec: dict, agent_email: str, stamp: str) -> str:
+    """Emit a Reelly off-plan record using the same tag set and order as the
+    Bitrix24 CRM properties. Tags absent from the CRM schema (price_currency,
+    source) are deliberately omitted; tags missing from the API response are
+    filled with safe defaults so downstream parsers see a consistent shape."""
     rid = rec.get("id")
     if rid is None:
         return ""
@@ -202,16 +206,44 @@ def _intl_block(rec: dict, agent_email: str, stamp: str) -> str:
     community = location_name
     sub_community = location_name
 
+    lat = rec.get("latitude")
+    lng = rec.get("longitude")
+    geopoints = f"{lat},{lng}" if lat not in (None, "") and lng not in (None, "") else ""
+
+    permit = rec.get("permit_number") or ""
+    parking = rec.get("parking") or "0"
+    build_year = rec.get("build_year") or ""
+    furnished_raw = rec.get("furnished")
+    if furnished_raw in (True, "1", 1, "yes", "Yes", "YES"):
+        furnished = "Yes"
+    elif furnished_raw in (False, "0", 0, "no", "No", "NO", None, ""):
+        furnished = "No"
+    else:
+        furnished = str(furnished_raw)
+    poa_raw = rec.get("price_on_application")
+    if poa_raw in (True, "1", 1, "yes", "Yes", "YES"):
+        poa = "YES"
+    else:
+        poa = "NO"
+    is_featured = "1" if rec.get("is_featured") in (True, 1, "1", "yes", "Yes") else "0"
+    is_exclusive = "1" if rec.get("is_exclusive") in (True, 1, "1", "yes", "Yes") else "0"
+    project_name = rec.get("project_name") or rec.get("property_name") or ""
+
     photos = rec.get("photos") or []
     photo_urls = [(p.get("url") or "").strip() for p in photos if p.get("url")]
 
-    parts = [
-        f'<property last_update="{stamp}" id="{pid}">',
-        f"<reference_number><![CDATA[{_cdata(ref)}]]></reference_number>",
+    parts = [f'<property last_update="{stamp}" id="{pid}">',
+             f"<reference_number><![CDATA[{_cdata(ref)}]]></reference_number>"]
+    if permit:
+        parts.append(f"<permit_number><![CDATA[{_cdata(permit)}]]></permit_number>")
+    parts.extend([
         f"<price><![CDATA[{_cdata(price)}]]></price>",
-        f"<price_currency><![CDATA[{_cdata(rec.get('price_currency') or 'AED')}]]></price_currency>",
         f"<offering_type><![CDATA[{_cdata(offering)}]]></offering_type>",
         f"<property_type><![CDATA[{_cdata(ptype)}]]></property_type>",
+    ])
+    if geopoints:
+        parts.append(f"<geopoints><![CDATA[{_cdata(geopoints)}]]></geopoints>")
+    parts.extend([
         f"<city><![CDATA[{_cdata(city)}]]></city>",
         f"<community><![CDATA[{_cdata(community)}]]></community>",
         f"<sub_community><![CDATA[{_cdata(sub_community)}]]></sub_community>",
@@ -221,10 +253,10 @@ def _intl_block(rec: dict, agent_email: str, stamp: str) -> str:
         f"<bedroom><![CDATA[{_cdata(bedroom)}]]></bedroom>",
         f"<bathroom><![CDATA[{_cdata(bathroom)}]]></bathroom>",
         f"<completion_status><![CDATA[{_cdata(completion)}]]></completion_status>",
-        f"<developer><![CDATA[{_cdata(rec.get('developer') or '')}]]></developer>",
-        "<source><![CDATA[reelly-uae-offplan]]></source>",
-        render_agent_block(TARGET_AGENTS[agent_email]),
-    ]
+    ])
+    if build_year:
+        parts.append(f"<build_year><![CDATA[{_cdata(build_year)}]]></build_year>")
+    parts.append(render_agent_block(TARGET_AGENTS[agent_email]))
     if photo_urls:
         photo_section = ["<photo>"]
         for u in photo_urls[:30]:
@@ -232,10 +264,21 @@ def _intl_block(rec: dict, agent_email: str, stamp: str) -> str:
             photo_section.append(f"<original_url><![CDATA[{_cdata(u)}]]></original_url>")
         photo_section.append("</photo>")
         parts.append("".join(photo_section))
-    parts.append("<is_featured><![CDATA[0]]></is_featured>")
-    parts.append("<is_exclusive><![CDATA[0]]></is_exclusive>")
-    parts.append("<branch><![CDATA[Off-Plan UAE]]></branch>")
-    parts.append("</property>")
+    parts.extend([
+        f"<parking><![CDATA[{_cdata(parking)}]]></parking>",
+        f"<furnished><![CDATA[{_cdata(furnished)}]]></furnished>",
+        "<private_amenities><![CDATA[]]></private_amenities>",
+        f"<developer><![CDATA[{_cdata(rec.get('developer') or '')}]]></developer>",
+    ])
+    if project_name:
+        parts.append(f"<project_name><![CDATA[{_cdata(project_name)}]]></project_name>")
+    parts.extend([
+        f"<price_on_application><![CDATA[{poa}]]></price_on_application>",
+        f"<is_featured><![CDATA[{is_featured}]]></is_featured>",
+        f"<is_exclusive><![CDATA[{is_exclusive}]]></is_exclusive>",
+        "<branch><![CDATA[Off-Plan UAE]]></branch>",
+        "</property>",
+    ])
     return "".join(parts)
 
 

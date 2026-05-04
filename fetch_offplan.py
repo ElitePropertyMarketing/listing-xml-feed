@@ -44,7 +44,10 @@ UAE_COUNTRY_IDS = {193, 182}
 NON_UAE_RE = re.compile(
     r"\b(bali|oman|salalah|yiti|sifah|phuket|thailand|indonesia|nuanu|"
     r"canggu|ubud|bukit|uluwatu|berawa|kuta|sanur|seminyak|cemagi|"
-    r"pererenan|seseh|candi\s*dasa|hawana|nai\s*harn|muscat)\b",
+    r"pererenan|seseh|candi\s*dasa|hawana|nai\s*harn|muscat|"
+    r"united\s*kingdom|england|scotland|wales|northern\s*ireland|"
+    r"london|manchester|birmingham|liverpool|leeds|nottingham|"
+    r"sheffield|bristol|newcastle|glasgow|edinburgh|cardiff|belfast)\b",
     re.IGNORECASE,
 )
 

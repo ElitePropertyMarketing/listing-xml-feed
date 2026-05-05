@@ -4,8 +4,9 @@ Public, daily-refreshed XML feed used by third-party integrations.
 
 - **Live URL**: <https://elitepropertymarketing.github.io/listing-xml-feed/full.xml>
 - **Schedule**: every day at 02:00 Dubai time (cron `0 22 * * *` UTC)
-- **Sources**: Bitrix24 CRM (840 listings) + Reelly UAE off-plan, excluding Completed (~1,476 listings) = **~2,316 listings total**
+- **Sources**: Bitrix24 CRM (~834 listings) + Reelly UAE off-plan, excluding Completed and incomplete records (~853 listings) = **~1,687 listings total**
 - **Agents**: 6 (Evelyn, Alba, Diana, Aaron, Jake, Jennifer). Off-plan listings are split equally; CRM listings stay with their owner if it's one of the 6, otherwise they're routed by `offering_type`.
+- **Off-plan quality gate**: a Reelly record is only included if it has a non-zero price and size, a description of at least 50 characters, at least one photo URL, and populated developer / property_type / offering_type fields. UK projects and any records flagged Completed are dropped before this check.
 
 ## Files
 

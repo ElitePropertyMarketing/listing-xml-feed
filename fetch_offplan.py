@@ -67,6 +67,44 @@ def is_active(rec: dict) -> bool:
     return (rec.get("completion_status") or "").strip().lower() != "completed"
 
 
+def _has_value(v) -> bool:
+    if v is None:
+        return False
+    s = str(v).strip()
+    if s in ("", "0", "0.0", "0.00", "null", "None"):
+        return False
+    return True
+
+
+def is_complete(rec: dict) -> bool:
+    """Quality gate: drop off-plan projects with incomplete data so the merged
+    feed only contains records comparable to the curated Bitrix24 CRM listings.
+
+    Bedroom/bathroom are intentionally not required because Reelly records
+    represent multi-unit projects (the API leaves those fields blank at the
+    project level)."""
+    if not _has_value(rec.get("price")):
+        return False
+    if not _has_value(rec.get("size")):
+        return False
+    title = rec.get("title_en") or rec.get("property_name")
+    if not _has_value(title):
+        return False
+    desc = rec.get("description_en") or ""
+    if len(str(desc).strip()) < 50:
+        return False
+    photos = rec.get("photos") or []
+    if not any((p or {}).get("url") for p in photos):
+        return False
+    if not _has_value(rec.get("developer")):
+        return False
+    if not _has_value(rec.get("property_type")):
+        return False
+    if not _has_value(rec.get("offering_type")):
+        return False
+    return True
+
+
 def fetch_json(url: str, *, retries: int = 3, timeout: int = 30) -> dict[str, Any]:
     last_err: Exception | None = None
     for attempt in range(1, retries + 1):
@@ -109,12 +147,14 @@ def main() -> int:
 
     uae = [r for r in all_records if is_uae(r)]
     active = [r for r in uae if is_active(r)]
+    complete = [r for r in active if is_complete(r)]
 
     print(f"After UAE filter                : {len(uae)}", file=sys.stderr)
     print(f"After UAE + active filter       : {len(active)}", file=sys.stderr)
+    print(f"After completeness filter       : {len(complete)}", file=sys.stderr)
 
     out_path.write_text(
-        json.dumps({"international": active}, ensure_ascii=False),
+        json.dumps({"international": complete}, ensure_ascii=False),
         encoding="utf-8",
     )
     print(f"Wrote {out_path}", file=sys.stderr)

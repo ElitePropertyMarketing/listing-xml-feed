@@ -121,8 +121,10 @@ FALLBACK_POOL = list(TARGET_AGENTS.keys())
 
 PROPERTY_RE = re.compile(r"<property\b[^>]*>.*?</property>", re.DOTALL)
 AGENT_RE = re.compile(r"<agent>.*?</agent>", re.DOTALL)
+OWNER_RE = re.compile(r"<owner>.*?</owner>", re.DOTALL)
 OFFERING_RE = re.compile(r"<offering_type>\s*<!\[CDATA\[([^\]]*)\]\]>\s*</offering_type>", re.DOTALL)
 EMAIL_RE = re.compile(r"<agent>.*?<email>\s*<!\[CDATA\[([^\]]*)\]\]>\s*</email>.*?</agent>", re.DOTALL)
+OWNER_EMAIL_RE = re.compile(r"<owner>.*?<email>\s*<!\[CDATA\[([^\]]*)\]\]>\s*</email>.*?</owner>", re.DOTALL)
 LIST_OPEN_RE = re.compile(r"<list\b([^>]*)>")
 LISTING_COUNT_RE = re.compile(r'listing_count="(\d+)"')
 
@@ -137,6 +139,21 @@ def render_agent_block(a: dict) -> str:
         f"<photo><![CDATA[{a['photo']}]]></photo>"
         f"<license_no><![CDATA[{a['license_no']}]]></license_no>"
         "</agent>"
+    )
+
+
+def render_owner_block(a: dict) -> str:
+    # Bitrix24's <owner> uses the same field set as <agent>. Mirror the chosen
+    # agent here so consumers that read <owner> see one of the 6 target agents.
+    return (
+        "<owner>"
+        f"<id><![CDATA[{a['id']}]]></id>"
+        f"<name><![CDATA[{a['name']}]]></name>"
+        f"<email><![CDATA[{a['email']}]]></email>"
+        f"<phone><![CDATA[{a['phone']}]]></phone>"
+        f"<photo><![CDATA[{a['photo']}]]></photo>"
+        f"<license_no><![CDATA[{a['license_no']}]]></license_no>"
+        "</owner>"
     )
 
 
@@ -333,12 +350,20 @@ def rebuild(xml_text: str, extra_property_blocks: list[str] | None = None) -> tu
     new_properties: list[str] = []
     for prop in properties:
         m_email = EMAIL_RE.search(prop)
-        current_email = m_email.group(1).strip().lower() if m_email else ""
+        agent_email = m_email.group(1).strip().lower() if m_email else ""
+        m_owner_email = OWNER_EMAIL_RE.search(prop)
+        owner_email = m_owner_email.group(1).strip().lower() if m_owner_email else ""
         m_off = OFFERING_RE.search(prop)
         offering = (m_off.group(1).strip().upper() if m_off else "")
 
-        if current_email in TARGET_AGENTS:
-            chosen_email = current_email
+        # Prefer keeping the listing under whichever current email already
+        # belongs to one of the 6 target agents. Check <agent> first, then
+        # <owner>, so a target agent in either tag wins.
+        if agent_email in TARGET_AGENTS:
+            chosen_email = agent_email
+            stats["kept_with_owner"][chosen_email] += 1
+        elif owner_email in TARGET_AGENTS:
+            chosen_email = owner_email
             stats["kept_with_owner"][chosen_email] += 1
         else:
             pool = ROUTING.get(offering)
@@ -352,12 +377,21 @@ def rebuild(xml_text: str, extra_property_blocks: list[str] | None = None) -> tu
             pool_index[key] += 1
             stats["reassigned_by_pool"][offering or "?"] += 1
 
-        agent_block = render_agent_block(TARGET_AGENTS[chosen_email])
+        agent = TARGET_AGENTS[chosen_email]
+        agent_block = render_agent_block(agent)
+        owner_block = render_owner_block(agent)
+
         if AGENT_RE.search(prop):
             new_prop = AGENT_RE.sub(agent_block, prop, count=1)
         else:
             stats["missing_agent_block"] += 1
             new_prop = prop.replace("</property>", agent_block + "</property>", 1)
+
+        # Rewrite <owner> too so downstream consumers reading <owner> only see
+        # the same 6 agents. Leave the property untouched if it had no <owner>
+        # block to begin with (e.g. off-plan blocks we generate ourselves).
+        if OWNER_RE.search(new_prop):
+            new_prop = OWNER_RE.sub(owner_block, new_prop, count=1)
 
         new_properties.append(new_prop)
         stats["assigned_to"][chosen_email] += 1

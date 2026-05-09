@@ -87,14 +87,22 @@ jobs:
               "diana@elitepropertydxb.com",  "aaron@elitepropertydxb.com",
               "jake@elitepropertydxb.com",   "jennifer@elitepropertydxb.com",
           }
-          emails = set()
+          agent_emails = set()
+          owner_emails = set()
           for p in props:
               a = p.find("agent")
               if a is not None:
-                  emails.add((a.findtext("email") or "").strip().lower())
-          extra = emails - allowed
-          if extra:
-              print(f"REFUSING TO PUBLISH: unexpected agents in output: {extra}")
+                  agent_emails.add((a.findtext("email") or "").strip().lower())
+              o = p.find("owner")
+              if o is not None:
+                  owner_emails.add((o.findtext("email") or "").strip().lower())
+          extra_agent = agent_emails - allowed
+          extra_owner = owner_emails - allowed
+          if extra_agent:
+              print(f"REFUSING TO PUBLISH: unexpected <agent> emails in output: {extra_agent}")
+              sys.exit(1)
+          if extra_owner:
+              print(f"REFUSING TO PUBLISH: unexpected <owner> emails in output: {extra_owner}")
               sys.exit(1)
           print("Sanity check passed.")
           PY

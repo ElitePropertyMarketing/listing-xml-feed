@@ -61,11 +61,25 @@ jobs:
           fi
           ls -lh /tmp/feed.xml
 
-      - name: Rebuild feed (6-agent rewrite, Bitrix24 CRM only)
+      - name: Rebuild feed (6-agent rewrite, Bitrix24 CRM + static extras)
         run: |
           set -euo pipefail
           mkdir -p _site
-          python3 rebuild_feed.py /tmp/feed.xml _site/full.xml
+          EXTRA_ARGS=()
+          for f in extras/*.xml; do
+            [ -f "$f" ] || continue
+            EXTRA_ARGS+=(--extras "$f")
+          done
+          python3 rebuild_feed.py /tmp/feed.xml _site/full.xml "${EXTRA_ARGS[@]}"
+
+      - name: Copy extras image assets into the published site
+        run: |
+          set -euo pipefail
+          if [ -d extras/images ]; then
+            mkdir -p _site/images
+            cp -r extras/images/. _site/images/
+            ls -R _site/images | head -50
+          fi
 
       - name: Sanity check output
         run: |

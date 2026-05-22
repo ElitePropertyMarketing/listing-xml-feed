@@ -24,7 +24,6 @@ import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import quote
 
 
 # ---------------------------------------------------------------------------
@@ -81,11 +80,7 @@ TARGET_AGENTS = {
         "name": "Jennifer Gorodetski",
         "email": "jennifer@elitepropertydxb.com",
         "phone": "971547223923",
-        "photo": (
-            "https://crm.elitepropertydxb.com/upload/main/cc2/"
-            "w38yu03o7n09nmmjg2qs1o5jl6uh4u8j/"
-            + quote("WhatsApp Image 2026-02-05 at 5.58.56 PM.png")
-        ),
+        "photo": "https://listing.s3.us-east-1.amazonaws.com/eliteproperty/agent_photos/agent_1738.png",
         "license_no": "",
     },
 }
@@ -420,6 +415,16 @@ def main() -> int:
     parser.add_argument("source", nargs="?", default="feed.xml")
     parser.add_argument("output", nargs="?", default="new_feed.xml")
     parser.add_argument("--offplan", help="Path to pre-filtered UAE off-plan JSON (from fetch_offplan.py)")
+    parser.add_argument(
+        "--extras",
+        action="append",
+        default=[],
+        help=(
+            "Path to a file containing additional raw <property>...</property> blocks "
+            "to merge into the feed. Repeatable. Blocks go through the same 6-agent "
+            "rewrite, sanity checks and offering-type routing as CRM properties."
+        ),
+    )
     args = parser.parse_args()
 
     src = Path(args.source)
@@ -432,6 +437,16 @@ def main() -> int:
         json_path = Path(args.offplan)
         extras, offplan_per_agent = build_offplan_blocks(json_path)
         sys.stderr.write(f"Off-plan blocks merged    : {len(extras)} (from {json_path})\n")
+
+    for extra_path in args.extras:
+        p = Path(extra_path)
+        text = p.read_text(encoding="utf-8")
+        blocks = PROPERTY_RE.findall(text)
+        if not blocks:
+            sys.stderr.write(f"WARNING: no <property> blocks found in {p}\n")
+            continue
+        extras.extend(blocks)
+        sys.stderr.write(f"Extra blocks merged      : {len(blocks)} (from {p})\n")
 
     new_xml, stats = rebuild(xml_text, extra_property_blocks=extras)
     out.write_text(new_xml, encoding="utf-8")
